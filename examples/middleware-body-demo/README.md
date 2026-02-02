@@ -150,7 +150,7 @@ make build
 cd examples/middleware-body-demo
 
 # daprd 软连接
-ln -s /workspaces/dapr/dist/linux_arm64/release/daprd /usr/local/bin/daprd
+ln -s /workspaces/dapr/dist/linux_amd64/release/daprd /usr/local/bin/daprd
 
 # 使用 dist/linux_arm64/release/daprd 启动应用
 daprd \
@@ -158,6 +158,7 @@ daprd \
   --app-port 8080 \
   --dapr-http-port 3500 \
   --config dapr-config.yaml \
+  --log-level debug \
   --components-path ./components
 
 # 运行测试程序

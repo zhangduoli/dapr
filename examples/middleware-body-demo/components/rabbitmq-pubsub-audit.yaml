@@ -1,0 +1,14 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: rabbitmq-pubsub-audit
+spec:
+  type: pubsub.rabbitmq
+  version: v1
+  metadata:
+    - name: host
+      value: "amqp://user:password@localhost:5672"
+    - name: exchangeKind
+      value: "topic"     # fanout / direct / topic
+    - name: exchangeName
+      value: "ebr_audit_topic"

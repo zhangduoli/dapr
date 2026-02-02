@@ -25,7 +25,15 @@ spec:
     value: "/health,\\?.*[Qq][Uu][Ee][Rr][Yy]" # 排除健康检查、url中包含query字符串，query字符不区分大小写，逗号分隔多个模式
   - name: logMethods
     value: "POST,PUT,DELETE"  # 需要记录日志的HTTP方法
-  - name: bindingName
-    value: "log-binding"  # 发送日志的 binding 名称
+  # Pub/Sub 推送配置（配置了 pubsubName + topicName 后优先走 pub/sub 发布）
+  - name: pubsubName
+    value: "rabbitmq-pubsub"  # 对应 rabbitmq-pubsub 组件的 metadata.name
+  - name: topicName
+    value: "default_topic"        # 默认 topic（不包含 meta 的消息）
+  # 可选：审计 topic 推送配置（当消息包含 meta 时发布到该 topic）
+  - name: auditPubsubName
+    value: "rabbitmq-pubsub-audit" # 对应 rabbitmq-pubsub-audit 组件的 metadata.name
+  - name: auditTopicName
+    value: "ebr_audit_topic"       # 包含 meta 的消息发布到该 topic
   - name: includeHeaders
     value: "Authorization,User-Agent,Content-Type,X-Custom-Data,X-Permissions" # 需要记录的 header 名称，支持 JSON 格式

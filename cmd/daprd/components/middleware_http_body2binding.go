@@ -26,6 +26,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -39,76 +40,97 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-// DataMessage 定义发送到 binding 的数据消息结构
+// DataMessage 定义发送到 pub/sub 的数据消息结构
 type DataMessage struct {
 	Timestamp    string      `json:"timestamp"`
 	FunctionCode string      `json:"functionCode"`
 	ActionCode   string      `json:"actionCode"`
 	RequestBody  interface{} `json:"requestBody,omitempty"`
 	ResponseBody interface{} `json:"responseBody,omitempty"`
+	Meta         interface{} `json:"meta,omitempty"`
 	Method       string      `json:"method"`
 	Path         string      `json:"path"`
 	Headers      interface{} `json:"headers,omitempty"`
 }
 
-// sendDataToBinding 通过 gRPC API 发送数据消息到指定的 binding
-func sendDataToBinding(bindingName, daprGRPCPort string, dataMsg DataMessage, log logger.Logger) {
-	if bindingName == "" {
+type pubsubPublisher struct {
+	daprGRPCPort string
+	log          logger.Logger
+
+	mu     sync.Mutex
+	conn   *grpc.ClientConn
+	client runtimev1pb.DaprClient
+}
+
+func newPubsubPublisher(daprGRPCPort string, log logger.Logger) *pubsubPublisher {
+	return &pubsubPublisher{
+		daprGRPCPort: daprGRPCPort,
+		log:          log,
+	}
+}
+
+func (p *pubsubPublisher) getClient() runtimev1pb.DaprClient {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.client != nil {
+		return p.client
+	}
+
+	conn, err := grpc.NewClient(
+		fmt.Sprintf("localhost:%s", p.daprGRPCPort),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		p.log.Errorf("gRPC connect failed: %v", err)
+		return nil
+	}
+
+	p.conn = conn
+	p.client = runtimev1pb.NewDaprClient(conn)
+	return p.client
+}
+
+// publish 通过 gRPC API 发布事件到指定的 pub/sub topic。
+// 复用 gRPC 连接，避免每条消息都 NewClient。
+func (p *pubsubPublisher) publish(pubsubName, topicName string, dataMsg DataMessage) {
+	if pubsubName == "" || topicName == "" {
+		return
+	}
+
+	client := p.getClient()
+	if client == nil {
+		p.log.Errorf("Dapr gRPC client not available")
 		return
 	}
 
 	// 获取API令牌，优先环境变量，其次metadata配置
-	apiToken := os.Getenv("DAPR_API_TOKEN")
-	if apiToken == "" {
-		apiToken = os.Getenv("DAPR_API_TOKEN") // 可扩展为从metadata读取
-	}
+	apiToken := os.Getenv("DAPR_API_TOKEN") // 可扩展为从metadata读取
 
 	// 异步发送以避免阻塞请求
 	go func() {
-		// 序列化数据消息
 		jsonData, err := json.Marshal(dataMsg)
 		if err != nil {
-			log.Errorf("Marshal data failed: %v", err)
+			p.log.Errorf("Marshal data failed: %v", err)
 			return
 		}
-		// 打印日志
-		log.Debugf("Sending data to binding %s: %s", bindingName, string(jsonData))
+		p.log.Debugf("Publishing data to pubsub %s topic %s: %s", pubsubName, topicName, string(jsonData))
 
-		// 连接到 Dapr gRPC API
-		conn, err := grpc.NewClient(
-			fmt.Sprintf("localhost:%s", daprGRPCPort),
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		)
-		if err != nil {
-			log.Errorf("gRPC connect failed: %v", err)
-			return
-		}
-		defer conn.Close()
-
-		client := runtimev1pb.NewDaprClient(conn)
-
-		// 调用 binding
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		// 注入API令牌到metadata
 		if apiToken != "" {
 			md := metadata.Pairs("dapr-api-token", apiToken)
 			ctx = metadata.NewOutgoingContext(ctx, md)
 		}
 
-		req := &runtimev1pb.InvokeBindingRequest{
-			Name:      bindingName,
-			Data:      jsonData,
-			Operation: "create",
-			Metadata:  map[string]string{},
-		}
-
-		log.Debugf("Sending data to binding %s via gRPC", bindingName)
-
-		_, err = client.InvokeBinding(ctx, req)
+		_, err = client.PublishEvent(ctx, &runtimev1pb.PublishEventRequest{
+			PubsubName: pubsubName,
+			Topic:      topicName,
+			Data:       jsonData,
+		})
 		if err != nil {
-			log.Errorf("Binding %s invoke failed: %v", bindingName, err)
+			p.log.Errorf("Pubsub %s publish to topic %s failed: %v", pubsubName, topicName, err)
 		}
 	}()
 }
@@ -117,19 +139,31 @@ func init() {
 	httpMiddlewareLoader.DefaultRegistry.RegisterComponent(func(log logger.Logger) httpMiddlewareLoader.FactoryMethod {
 		return func(metadata contribmiddleware.Metadata) (middleware.HTTP, error) {
 			// 获取日志文件路径，默认为 middleware_body.log
-			logFile := metadata.Properties["logFile"]
+			// logFile := metadata.Properties["logFile"]
 
-			// 获取 binding 名称，如果配置了则使用 binding 发送日志
-			bindingName := metadata.Properties["bindingName"]
+			// 获取 pubsub 配置（必需）：默认 topic 推送
+			pubsubName := metadata.Properties["pubsubName"]
+			topicName := metadata.Properties["topicName"]
+
+			// 可选：审计 topic 推送配置。
+			// 当消息包含 meta（DataMessage.Meta 非空）时，将发布到 auditPubsubName+auditTopicName。
+			// auditPubsubName 为空时默认复用 pubsubName。
+			auditPubsubName := metadata.Properties["auditPubsubName"]
+			auditTopicName := metadata.Properties["auditTopicName"]
+			if auditPubsubName == "" {
+				auditPubsubName = pubsubName
+			}
 
 			// 获取 Dapr gRPC 端口，优先从环境变量获取
 			daprGRPCPort := os.Getenv("DAPR_GRPC_PORT")
 			if daprGRPCPort == "" {
 				daprGRPCPort = metadata.Properties["daprGRPCPort"]
 				if daprGRPCPort == "" {
-					daprGRPCPort = "50001"
+					daprGRPCPort = "3500"
 				}
 			}
+
+			publisher := newPubsubPublisher(daprGRPCPort, log)
 
 			// 获取是否记录请求体，默认为 true
 			logRequest := metadata.Properties["logRequest"] != "false"
@@ -221,6 +255,7 @@ func init() {
 			return func(next http.Handler) http.Handler {
 				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					var requestBodyObj interface{}
+					originalWriter := w
 
 					// 记录请求体
 					if logRequest && r.Body != nil {
@@ -229,14 +264,7 @@ func init() {
 							log.Errorf("Read request body failed: %v", err)
 							requestBodyObj = map[string]string{"error": fmt.Sprintf("Read error: %v", err)}
 						} else {
-							// 尝试解析为 JSON
-							var jsonObj interface{}
-							if err := json.Unmarshal(requestBody, &jsonObj); err != nil {
-								// 如果不是有效的 JSON，则作为字符串存储
-								requestBodyObj = string(requestBody)
-							} else {
-								requestBodyObj = jsonObj
-							}
+							requestBodyObj = decodeJSONOrString(requestBody)
 							// 重置请求体供后续处理使用
 							r.Body = io.NopCloser(bytes.NewReader(requestBody))
 						}
@@ -244,31 +272,47 @@ func init() {
 
 					var responseBodyObj interface{}
 					var bodyRecorder *bodyResponseWriter
+					var responseMeta interface{}
 
 					// 如果需要记录响应体，包装响应写入器
 					if logResponse {
-						bodyRecorder = &bodyResponseWriter{
-							ResponseWriter: w,
-							body:           &bytes.Buffer{},
-							maxSize:        maxBodySize,
-						}
+						bodyRecorder = newBodyResponseWriter(maxBodySize)
 						w = bodyRecorder
 					}
 
 					// 调用下一个处理器
 					next.ServeHTTP(w, r)
 
-					// 获取响应体
+					// 获取响应体并提取 meta
 					if logResponse && bodyRecorder != nil {
 						responseBodyBytes := bodyRecorder.body.Bytes()
 						var jsonObj interface{}
 						if err := json.Unmarshal(responseBodyBytes, &jsonObj); err == nil {
 							// 有效 JSON
 							responseBodyObj = jsonObj
+							log.Debugf("response body is JSON")
+
+							// 检查是否存在 meta 字段
+							if respMap, ok := jsonObj.(map[string]interface{}); ok {
+								if meta, exists := respMap["meta"]; exists {
+									responseMeta = meta
+									// 从响应中删除 meta
+									delete(respMap, "meta")
+									responseBodyObj = respMap
+
+									// 重新序列化响应体（不含 meta）并写回
+									if modifiedBytes, err := json.Marshal(respMap); err == nil {
+										bodyRecorder.body.Reset()
+										bodyRecorder.body.Write(modifiedBytes)
+									}
+								}
+							}
 						} else if isText(responseBodyBytes) {
+							log.Debugf("Response body is text")
 							// 是文本（如UTF-8），直接保存为字符串
 							responseBodyObj = string(responseBodyBytes)
 						} else {
+							log.Debugf("Response body is binary")
 							// 二进制，保存为 base64
 							responseBodyObj = map[string]string{
 								"base64": base64.StdEncoding.EncodeToString(responseBodyBytes),
@@ -277,165 +321,151 @@ func init() {
 					}
 
 					// 记录到日志文件
-					if logRequest || logResponse {
-						// 检查当前请求方法是否在允许记录的方法列表中
-						if !allowedMethods[r.Method] {
-							return
-						}
+					shouldLog := logRequest || logResponse
+					if shouldLog {
+						// 检查是否为 EBR 行业类型且需要强制审计
+						industryType := os.Getenv("INDUSTRY_TYPE")
+						auditLog := strings.ToLower(r.Header.Get("X-Audit-Log")) == "true"
+						signLog := strings.ToLower(r.Header.Get("X-Sign-Log")) == "true"
+						isEBRForceAudit := industryType == "EBR" && (auditLog || signLog)
 
-						// 检查路径是否应该被记录
+						// 检查路径
 						requestPath := r.URL.RequestURI()
-						shouldLog := true
-
-						// 如果配置了包含路径，检查当前路径是否匹配任何包含模式
-						if len(includePathRegexes) > 0 {
-							shouldLog = false
-							for _, regex := range includePathRegexes {
-								if regex.MatchString(requestPath) {
-									shouldLog = true
-									break
-								}
-							}
-						}
-
-						// 如果路径通过包含检查，再检查是否在排除列表中
-						if shouldLog && len(excludePathRegexes) > 0 {
-							for _, regex := range excludePathRegexes {
-								if regex.MatchString(requestPath) {
-									shouldLog = false
-									break
-								}
-							}
-						}
-
-						// 如果路径被过滤掉，则不记录日志
-						if !shouldLog {
-							log.Debugf("Skipping log due to path filtering: %s", requestPath)
-							return
-						}
 
 						// 从 header 中获取功能码和动作码
 						functionCode := r.Header.Get(functionHeader)
 						actionCode := r.Header.Get(actionHeader)
 
-						// 如果功能码或动作码为空，则不记录日志
-						if functionCode == "" || actionCode == "" {
-							log.Debugf("Skipping log due to missing headers: functionCode=%s, actionCode=%s", functionCode, actionCode)
-							return
+						// 审计/签名日志必须携带功能码和动作码，否则不记录
+						if (auditLog || signLog) && (functionCode == "" || actionCode == "") {
+							log.Debugf("Skipping audit/sign log due to missing headers: functionCode=%s, actionCode=%s", functionCode, actionCode)
+							shouldLog = false
 						}
 
-						// 获取当前时间戳
-						timestamp := time.Now().Format(time.RFC3339)
+						// 如果不是 EBR 强制审计模式，则执行原有的过滤逻辑
+						if !isEBRForceAudit {
+							// 检查当前请求方法是否在允许记录的方法列表中
+							if !allowedMethods[r.Method] {
+								shouldLog = false
+							}
 
-						// 收集指定的 headers
-						var headers interface{}
-						if len(headerKeys) > 0 {
-							headersMap := make(map[string]interface{})
-							for _, headerKey := range headerKeys {
-								if headerValues := r.Header.Values(headerKey); len(headerValues) > 0 {
-									if len(headerValues) == 1 {
-										// 单个值：尝试解析为 JSON，失败则作为字符串
-										headerValue := headerValues[0]
-										var jsonObj interface{}
-										if err := json.Unmarshal([]byte(headerValue), &jsonObj); err != nil {
-											// 不是有效的 JSON，作为字符串存储
-											headersMap[headerKey] = headerValue
-										} else {
-											// 是有效的 JSON，存储解析后的对象
-											headersMap[headerKey] = jsonObj
-										}
-									} else {
-										// 多个值：创建数组，每个值尝试解析为 JSON
-										var valueArray []interface{}
-										for _, value := range headerValues {
-											var jsonObj interface{}
-											if err := json.Unmarshal([]byte(value), &jsonObj); err != nil {
-												// 不是有效的 JSON，作为字符串存储
-												valueArray = append(valueArray, value)
-											} else {
-												// 是有效的 JSON，存储解析后的对象
-												valueArray = append(valueArray, jsonObj)
-											}
-										}
-										headersMap[headerKey] = valueArray
+							// 检查路径是否应该被记录
+							pathShouldLog := true
+
+							// 如果配置了包含路径，检查当前路径是否匹配任何包含模式
+							if len(includePathRegexes) > 0 {
+								pathShouldLog = false
+								for _, regex := range includePathRegexes {
+									if regex.MatchString(requestPath) {
+										pathShouldLog = true
+										break
 									}
 								}
 							}
-							if len(headersMap) > 0 {
-								headers = headersMap
-							}
-						}
 
-						// 创建数据消息结构
-						dataMsg := DataMessage{
-							Timestamp:    timestamp,
-							FunctionCode: functionCode,
-							ActionCode:   actionCode,
-							Method:       r.Method,
-							Path:         requestPath,
-							Headers:      headers,
-						}
-
-						// 根据配置设置请求体和响应体
-						if logRequest {
-							dataMsg.RequestBody = requestBodyObj
-						}
-						if logResponse {
-							dataMsg.ResponseBody = responseBodyObj
-						}
-
-						log.Debugf("Logging %s %s: %s/%s", dataMsg.Method, dataMsg.Path, dataMsg.FunctionCode, dataMsg.ActionCode)
-
-						// 如果配置了 binding，则发送到 binding
-						if bindingName != "" {
-							sendDataToBinding(bindingName, daprGRPCPort, dataMsg, log)
-						}
-
-						// 同时写入日志文件（可选）
-						if logFile != "" {
-							// 将 JSON 对象序列化为字符串用于日志文件
-							var requestBodyStr, responseBodyStr string
-
-							if dataMsg.RequestBody != nil {
-								if reqBodyBytes, err := json.Marshal(dataMsg.RequestBody); err == nil {
-									requestBodyStr = string(reqBodyBytes)
-								} else {
-									requestBodyStr = fmt.Sprintf("%v", dataMsg.RequestBody)
+							// 如果路径通过包含检查，再检查是否在排除列表中
+							if pathShouldLog && len(excludePathRegexes) > 0 {
+								for _, regex := range excludePathRegexes {
+									if regex.MatchString(requestPath) {
+										pathShouldLog = false
+										break
+									}
 								}
 							}
 
-							if dataMsg.ResponseBody != nil {
-								if respBodyBytes, err := json.Marshal(dataMsg.ResponseBody); err == nil {
-									responseBodyStr = string(respBodyBytes)
-								} else {
-									responseBodyStr = fmt.Sprintf("%v", dataMsg.ResponseBody)
+							// 合并路径过滤结果
+							shouldLog = shouldLog && pathShouldLog
+
+							// 如果路径被过滤掉，则不记录日志
+							if !shouldLog {
+								log.Debugf("Skipping log due to path filtering: %s", requestPath)
+							}
+
+							// 如果功能码或动作码为空，则不记录日志
+							if functionCode == "" || actionCode == "" {
+								log.Debugf("Skipping log due to missing headers: functionCode=%s, actionCode=%s", functionCode, actionCode)
+								shouldLog = false
+							}
+						}
+
+						if shouldLog {
+							// pub/sub 只发布模式：需要默认 pubsubName/topicName，否则不发布
+							if pubsubName == "" || topicName == "" {
+								log.Debugf("Skipping publish because pubsubName/topicName not configured")
+								shouldLog = false
+							}
+						}
+
+						if shouldLog {
+							// 获取当前时间戳
+							timestamp := time.Now().Format(time.RFC3339)
+
+							// 收集指定的 headers
+							var headers interface{}
+							if len(headerKeys) > 0 {
+								headersMap := make(map[string]interface{})
+								for _, headerKey := range headerKeys {
+									if headerValues := r.Header.Values(headerKey); len(headerValues) > 0 {
+										if len(headerValues) == 1 {
+											// 单个值：尝试解析为 JSON，失败则作为字符串
+											headersMap[headerKey] = decodeJSONOrString([]byte(headerValues[0]))
+										} else {
+											// 多个值：创建数组，每个值尝试解析为 JSON
+											var valueArray []interface{}
+											for _, value := range headerValues {
+												valueArray = append(valueArray, decodeJSONOrString([]byte(value)))
+											}
+											headersMap[headerKey] = valueArray
+										}
+									}
+								}
+								if len(headersMap) > 0 {
+									headers = headersMap
 								}
 							}
 
-							// 将换行符和分隔符替换为空格，确保一行记录
-							requestBodyStr = strings.ReplaceAll(strings.ReplaceAll(requestBodyStr, "\n", " "), "|", "｜")
-							responseBodyStr = strings.ReplaceAll(strings.ReplaceAll(responseBodyStr, "\n", " "), "|", "｜")
+							// 创建数据消息结构
+							dataMsg := DataMessage{
+								Timestamp:    timestamp,
+								FunctionCode: functionCode,
+								ActionCode:   actionCode,
+								Method:       r.Method,
+								Path:         requestPath,
+								Headers:      headers,
+							}
 
-							logEntry := fmt.Sprintf("%s|%s|%s|%s|%s\n",
-								timestamp,
-								functionCode,
-								actionCode,
-								requestBodyStr,
-								responseBodyStr)
+							// 根据配置设置请求体和响应体
+							if logRequest {
+								dataMsg.RequestBody = requestBodyObj
+							}
+							if logResponse {
+								// 设置响应体（不含 meta 的完整响应）
+								dataMsg.ResponseBody = responseBodyObj
+							}
 
-							// 异步写入日志文件以减少性能影响
-							go func() {
-								file, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-								if err != nil {
-									log.Errorf("Open log file failed: %v", err)
-									return
-								}
-								defer file.Close()
+							// 检查是否需要记录 meta（复用前面的变量）
+							includeMeta := auditLog || signLog
 
-								if _, err := file.WriteString(logEntry); err != nil {
-									log.Errorf("Write log file failed: %v", err)
-								}
-							}()
+							// 如果需要记录 meta 且 meta 存在，将 meta 单独记录到 Meta 字段
+							if includeMeta && responseMeta != nil {
+								dataMsg.Meta = responseMeta
+							}
+
+							log.Debugf("Logging %s %s: %s/%s", dataMsg.Method, dataMsg.Path, dataMsg.FunctionCode, dataMsg.ActionCode)
+
+							// 推送：有 meta 的消息发到 ebr_audit_topic；其他发到默认 topic。
+							if dataMsg.Meta != nil && auditPubsubName != "" && auditTopicName != "" {
+								publisher.publish(auditPubsubName, auditTopicName, dataMsg)
+							}
+							// 否则发到默认 topic
+							publisher.publish(pubsubName, topicName, dataMsg)
+						}
+					}
+
+					// 将（可能已删除 meta 的）最终响应写回给调用方
+					if logResponse && bodyRecorder != nil {
+						if err := bodyRecorder.WriteTo(originalWriter); err != nil {
+							log.Errorf("Write response back failed: %v", err)
 						}
 					}
 				})
@@ -455,11 +485,28 @@ func isText(data []byte) bool {
 	return true
 }
 
+func decodeJSONOrString(data []byte) interface{} {
+	var jsonObj interface{}
+	if err := json.Unmarshal(data, &jsonObj); err != nil {
+		return string(data)
+	}
+	return jsonObj
+}
+
 // bodyResponseWriter 包装 http.ResponseWriter 以捕获响应体
 type bodyResponseWriter struct {
-	http.ResponseWriter
+	header  http.Header
 	body    *bytes.Buffer
 	maxSize int64
+	status  int
+}
+
+func newBodyResponseWriter(maxSize int64) *bodyResponseWriter {
+	return &bodyResponseWriter{
+		header:  make(http.Header),
+		body:    &bytes.Buffer{},
+		maxSize: maxSize,
+	}
 }
 
 func (brw *bodyResponseWriter) Write(p []byte) (int, error) {
@@ -472,16 +519,39 @@ func (brw *bodyResponseWriter) Write(p []byte) (int, error) {
 		brw.body.Write(p[:remaining])
 	}
 
-	// 写入原始响应
-	return brw.ResponseWriter.Write(p)
+	// 不直接写入原始响应，等 next 结束后统一处理/修改再写回
+	return len(p), nil
 }
 
 // Header 返回响应头
 func (brw *bodyResponseWriter) Header() http.Header {
-	return brw.ResponseWriter.Header()
+	return brw.header
 }
 
 // WriteHeader 写入响应状态码
 func (brw *bodyResponseWriter) WriteHeader(statusCode int) {
-	brw.ResponseWriter.WriteHeader(statusCode)
+	if brw.status == 0 {
+		brw.status = statusCode
+	}
+}
+
+func (brw *bodyResponseWriter) Flush() {}
+
+func (brw *bodyResponseWriter) WriteTo(w http.ResponseWriter) error {
+	// 复制 headers（避免共享底层 slice）
+	for k, vv := range brw.header {
+		copied := make([]string, len(vv))
+		copy(copied, vv)
+		w.Header()[k] = copied
+	}
+	// body 可能被修改，删除 Content-Length 让 net/http 自动计算
+	w.Header().Del("Content-Length")
+
+	statusCode := brw.status
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
+	w.WriteHeader(statusCode)
+	_, err := w.Write(brw.body.Bytes())
+	return err
 }

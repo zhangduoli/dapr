@@ -11,11 +11,16 @@ import (
 	"github.com/gorilla/mux"
 )
 
+type APIResponse struct {
+	Data interface{} `json:"data"`
+	Meta []string    `json:"meta"`
+}
+
 type User struct {
-	ID       int       `json:"id"`
-	Name     string    `json:"name"`
-	Email    string    `json:"email"`
-	Created  time.Time `json:"created"`
+	ID      int       `json:"id"`
+	Name    string    `json:"name"`
+	Email   string    `json:"email"`
+	Created time.Time `json:"created"`
 }
 
 type CreateUserRequest struct {
@@ -56,9 +61,9 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	// 从 header 中获取模块码和动作码（用于演示）
 	moduleCode := r.Header.Get("X-Module-Code")
 	actionCode := r.Header.Get("X-Action-Code")
-	
+
 	log.Printf("处理请求：模块码=%s, 动作码=%s", moduleCode, actionCode)
-	
+
 	var req CreateUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "无效的请求体", http.StatusBadRequest)
@@ -76,40 +81,54 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		Email:   req.Email,
 		Created: time.Now(),
 	}
-	
 	users = append(users, user)
 	nextID++
 
+	resp := APIResponse{
+		Data: user,
+		Meta: []string{"createUser", "test-meta"},
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(user)
+	json.NewEncoder(w).Encode(resp)
 }
 
 func getUsers(w http.ResponseWriter, r *http.Request) {
+	resp := APIResponse{
+		Data: users,
+		Meta: []string{"getUsers", "test-meta"},
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(users)
+	json.NewEncoder(w).Encode(resp)
 }
 
 func getUser(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
-	
+
 	for _, user := range users {
 		if fmt.Sprintf("%d", user.ID) == id {
+			resp := APIResponse{
+				Data: user,
+				Meta: []string{"getUser", "test-meta"},
+			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(user)
+			json.NewEncoder(w).Encode(resp)
 			return
 		}
 	}
-	
 	http.Error(w, "用户不存在", http.StatusNotFound)
 }
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {
+	resp := APIResponse{
+		Data: map[string]interface{}{
+			"status":    "healthy",
+			"timestamp": time.Now(),
+			"users":     len(users),
+		},
+		Meta: []string{"healthCheck", "test-meta"},
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":    "healthy",
-		"timestamp": time.Now(),
-		"users":     len(users),
-	})
+	json.NewEncoder(w).Encode(resp)
 }
