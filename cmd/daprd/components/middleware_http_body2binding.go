@@ -17,6 +17,8 @@ package components
 
 import (
 	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -29,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -94,7 +97,12 @@ func (p *pubsubPublisher) getClient() runtimev1pb.DaprClient {
 // publish 通过 gRPC API 发布事件到指定的 pub/sub topic。
 // 复用 gRPC 连接，避免每条消息都 NewClient。
 func (p *pubsubPublisher) publish(pubsubName, topicName string, dataMsg DataMessage) {
-	if pubsubName == "" || topicName == "" {
+	if pubsubName == "" {
+		p.log.Debugf("publish skipped: pubsubName is empty")
+		return
+	}
+	if topicName == "" {
+		p.log.Debugf("publish skipped: topicName is empty")
 		return
 	}
 
@@ -131,7 +139,9 @@ func (p *pubsubPublisher) publish(pubsubName, topicName string, dataMsg DataMess
 		})
 		if err != nil {
 			p.log.Errorf("Pubsub %s publish to topic %s failed: %v", pubsubName, topicName, err)
+			return
 		}
+		p.log.Debugf("publish OK -> pubsub=%s topic=%s", pubsubName, topicName)
 	}()
 }
 
@@ -170,6 +180,9 @@ func init() {
 
 			// 获取是否记录响应体，默认为 true
 			logResponse := metadata.Properties["logResponse"] != "false"
+
+			log.Debugf("body2binding config: pubsubName=%s topicName=%s auditPubsubName=%s auditTopicName=%s daprGRPCPort=%s logRequest=%v logResponse=%v",
+				pubsubName, topicName, auditPubsubName, auditTopicName, daprGRPCPort, logRequest, logResponse)
 
 			// 获取最大记录体大小，默认为 1MB
 			maxBodySize := int64(1024 * 1024) // 1MB
@@ -252,8 +265,15 @@ func init() {
 				}
 			}
 
+			log.Debugf("body2binding config: functionHeader=%s actionHeader=%s allowedMethods=%v includePaths=%q excludePaths=%q includeHeaders=%v maxBodySize=%d",
+				functionHeader, actionHeader, logMethods, includePathsStr, excludePathsStr, headerKeys, maxBodySize)
+
 			return func(next http.Handler) http.Handler {
 				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					// 为每个请求生成 traceID，用于串联整条决策链日志
+					traceID := fmt.Sprintf("%s-%d", r.URL.Path, time.Now().UnixNano())
+					log.Debugf("[%s] enter: method=%s path=%s", traceID, r.Method, r.URL.RequestURI())
+
 					var requestBodyObj interface{}
 					originalWriter := w
 
@@ -267,6 +287,9 @@ func init() {
 							requestBodyObj = decodeJSONOrString(requestBody)
 							// 重置请求体供后续处理使用
 							r.Body = io.NopCloser(bytes.NewReader(requestBody))
+							// 打印所有请求头
+							headersJson, _ := json.Marshal(r.Header)
+							log.Debugf("Request headers for %s: %s", r.URL.RequestURI(), string(headersJson))
 						}
 					}
 
@@ -286,11 +309,43 @@ func init() {
 					// 获取响应体并提取 meta
 					if logResponse && bodyRecorder != nil {
 						responseBodyBytes := bodyRecorder.body.Bytes()
+
+						// 根据 Content-Encoding 响应头解压，支持 gzip / br(brotli) / deflate(zlib)。
+						// 后端(.NET)经 nginx 压缩后可能是 brotli，仅按 gzip 魔数判断会导致解压失败、
+						// 响应体被误判为 binary，进而取不到 meta。
+						decodedBytes := responseBodyBytes
+						contentEncoding := strings.ToLower(strings.TrimSpace(bodyRecorder.Header().Get("Content-Encoding")))
+						if len(responseBodyBytes) == 0 {
+							// 空响应体，无需处理
+						} else if contentEncoding != "" && contentEncoding != "identity" {
+							var err error
+							decodedBytes, err = decompress(responseBodyBytes, contentEncoding)
+							if err != nil {
+								log.Warnf("path:%s, failed to decompress response body with content-encoding=%s: %v", r.URL.RequestURI(), contentEncoding, err)
+								decodedBytes = responseBodyBytes
+							} else {
+								log.Debugf("path:%s, response body decompressed from %s", r.URL.RequestURI(), contentEncoding)
+							}
+						} else {
+							// 没有 Content-Encoding 头时，按魔数自动探测
+							if isGzipBytes(responseBodyBytes) {
+								if uncompressed, err := gunzip(responseBodyBytes); err == nil {
+									decodedBytes = uncompressed
+									log.Debugf("path:%s, response body decompressed from gzip (magic)", r.URL.RequestURI())
+								}
+							} else if isBrotliBytes(responseBodyBytes) {
+								if uncompressed, err := unbrotli(responseBodyBytes); err == nil {
+									decodedBytes = uncompressed
+									log.Debugf("path:%s, response body decompressed from brotli (magic)", r.URL.RequestURI())
+								}
+							}
+						}
+
 						var jsonObj interface{}
-						if err := json.Unmarshal(responseBodyBytes, &jsonObj); err == nil {
+						if err := json.Unmarshal(decodedBytes, &jsonObj); err == nil {
 							// 有效 JSON
 							responseBodyObj = jsonObj
-							log.Debugf("response body is JSON")
+							log.Debugf("path:%s, response body is JSON", r.URL.RequestURI())
 
 							// 检查是否存在 meta 字段
 							if respMap, ok := jsonObj.(map[string]interface{}); ok {
@@ -303,16 +358,32 @@ func init() {
 									// 重新序列化响应体（不含 meta）并写回
 									if modifiedBytes, err := json.Marshal(respMap); err == nil {
 										bodyRecorder.body.Reset()
-										bodyRecorder.body.Write(modifiedBytes)
+										if contentEncoding == "gzip" || isGzipBytes(responseBodyBytes) {
+											// 重新 gzip 压缩后写回
+											var buf bytes.Buffer
+											gw := gzip.NewWriter(&buf)
+											gw.Write(modifiedBytes)
+											gw.Close()
+											bodyRecorder.body.Write(buf.Bytes())
+										} else if contentEncoding == "br" || isBrotliBytes(responseBodyBytes) {
+											// 重新 brotli 压缩后写回
+											var buf bytes.Buffer
+											bw := brotli.NewWriter(&buf)
+											bw.Write(modifiedBytes)
+											bw.Close()
+											bodyRecorder.body.Write(buf.Bytes())
+										} else {
+											bodyRecorder.body.Write(modifiedBytes)
+										}
 									}
 								}
 							}
-						} else if isText(responseBodyBytes) {
-							log.Debugf("Response body is text")
+						} else if isText(decodedBytes) {
+							log.Debugf("path:%s, response body is text", r.URL.RequestURI())
 							// 是文本（如UTF-8），直接保存为字符串
-							responseBodyObj = string(responseBodyBytes)
+							responseBodyObj = string(decodedBytes)
 						} else {
-							log.Debugf("Response body is binary")
+							log.Debugf("path:%s, response body is binary", r.URL.RequestURI())
 							// 二进制，保存为 base64
 							responseBodyObj = map[string]string{
 								"base64": base64.StdEncoding.EncodeToString(responseBodyBytes),
@@ -322,12 +393,16 @@ func init() {
 
 					// 记录到日志文件
 					shouldLog := logRequest || logResponse
+					if !shouldLog {
+						log.Debugf("[%s] skip: logRequest=false && logResponse=false", traceID)
+					}
 					if shouldLog {
 						// 检查是否为 EBR 行业类型且需要强制审计
 						industryType := os.Getenv("INDUSTRY_TYPE")
 						auditLog := strings.ToLower(r.Header.Get("X-Audit-Log")) == "true"
 						signLog := strings.ToLower(r.Header.Get("X-Sign-Log")) == "true"
 						isEBRForceAudit := industryType == "EBR" && (auditLog || signLog)
+						log.Debugf("[%s] audit flags: auditLog=%v signLog=%v industryType=%s isEBRForceAudit=%v", traceID, auditLog, signLog, industryType, isEBRForceAudit)
 
 						// 检查路径
 						requestPath := r.URL.RequestURI()
@@ -338,7 +413,7 @@ func init() {
 
 						// 审计/签名日志必须携带功能码和动作码，否则不记录
 						if (auditLog || signLog) && (functionCode == "" || actionCode == "") {
-							log.Debugf("Skipping audit/sign log due to missing headers: functionCode=%s, actionCode=%s", functionCode, actionCode)
+							log.Debugf("[%s] skip: audit/sign log missing headers functionHeader(%s)=%q actionHeader(%s)=%q", traceID, functionHeader, functionCode, actionHeader, actionCode)
 							shouldLog = false
 						}
 
@@ -346,6 +421,7 @@ func init() {
 						if !isEBRForceAudit {
 							// 检查当前请求方法是否在允许记录的方法列表中
 							if !allowedMethods[r.Method] {
+								log.Debugf("[%s] skip: method %s not in allowedMethods [%s]", traceID, r.Method, logMethods)
 								shouldLog = false
 							}
 
@@ -361,12 +437,16 @@ func init() {
 										break
 									}
 								}
+								if !pathShouldLog {
+									log.Debugf("[%s] skip: path %s not matched by includePaths [%s]", traceID, requestPath, includePathsStr)
+								}
 							}
 
 							// 如果路径通过包含检查，再检查是否在排除列表中
 							if pathShouldLog && len(excludePathRegexes) > 0 {
 								for _, regex := range excludePathRegexes {
 									if regex.MatchString(requestPath) {
+										log.Debugf("[%s] skip: path %s matched excludePaths [%s]", traceID, requestPath, excludePathsStr)
 										pathShouldLog = false
 										break
 									}
@@ -376,22 +456,20 @@ func init() {
 							// 合并路径过滤结果
 							shouldLog = shouldLog && pathShouldLog
 
-							// 如果路径被过滤掉，则不记录日志
-							if !shouldLog {
-								log.Debugf("Skipping log due to path filtering: %s", requestPath)
-							}
-
 							// 如果功能码或动作码为空，则不记录日志
-							if functionCode == "" || actionCode == "" {
-								log.Debugf("Skipping log due to missing headers: functionCode=%s, actionCode=%s", functionCode, actionCode)
+							if shouldLog && (functionCode == "" || actionCode == "") {
+								log.Debugf("[%s] skip: missing headers functionHeader(%s)=%q actionHeader(%s)=%q", traceID, functionHeader, functionCode, actionHeader, actionCode)
 								shouldLog = false
 							}
 						}
 
 						if shouldLog {
 							// pub/sub 只发布模式：需要默认 pubsubName/topicName，否则不发布
-							if pubsubName == "" || topicName == "" {
-								log.Debugf("Skipping publish because pubsubName/topicName not configured")
+							if pubsubName == "" {
+								log.Debugf("[%s] skip: pubsubName not configured", traceID)
+								shouldLog = false
+							} else if topicName == "" {
+								log.Debugf("[%s] skip: topicName not configured", traceID)
 								shouldLog = false
 							}
 						}
@@ -449,15 +527,20 @@ func init() {
 							// 如果需要记录 meta 且 meta 存在，将 meta 单独记录到 Meta 字段
 							if includeMeta && responseMeta != nil {
 								dataMsg.Meta = responseMeta
+							} else if responseMeta != nil {
+								log.Debugf("[%s] response has meta but auditLog=%v signLog=%v, meta dropped", traceID, auditLog, signLog)
 							}
 
-							log.Debugf("Logging %s %s: %s/%s", dataMsg.Method, dataMsg.Path, dataMsg.FunctionCode, dataMsg.ActionCode)
+							log.Debugf("[%s] logging: method=%s path=%s functionCode=%s actionCode=%s hasMeta=%v", traceID, dataMsg.Method, dataMsg.Path, dataMsg.FunctionCode, dataMsg.ActionCode, dataMsg.Meta != nil)
 
-							// 推送：有 meta 的消息发到 ebr_audit_topic；其他发到默认 topic。
-							if dataMsg.Meta != nil && auditPubsubName != "" && auditTopicName != "" {
+							// 推送：带审计/签名标记(X-Audit-Log / X-Sign-Log)的消息发到审计 topic；其他只发默认 topic。
+							// 审计 topic 的触发以请求头为准，而不是依赖响应中的 meta 字段。
+							if (auditLog || signLog) && auditPubsubName != "" && auditTopicName != "" {
+								log.Debugf("[%s] publish to audit topic: pubsub=%s topic=%s", traceID, auditPubsubName, auditTopicName)
 								publisher.publish(auditPubsubName, auditTopicName, dataMsg)
 							}
-							// 否则发到默认 topic
+							// 发到默认 topic
+							log.Debugf("[%s] publish to default topic: pubsub=%s topic=%s", traceID, pubsubName, topicName)
 							publisher.publish(pubsubName, topicName, dataMsg)
 						}
 					}
@@ -472,6 +555,57 @@ func init() {
 			}, nil
 		}
 	}, "body2binding")
+}
+
+// isGzipBytes 判断是否为 gzip 压缩数据（魔数 0x1f 0x8b）。
+func isGzipBytes(data []byte) bool {
+	return len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b
+}
+
+// isBrotliBytes 判断是否可能是 brotli 压缩数据。
+// brotli 没有统一魔数，这里按常见前几个字节特征做保守判断：首字节为 0x0b 或 0x1b 等窗口标记。
+func isBrotliBytes(data []byte) bool {
+	if len(data) < 2 {
+		return false
+	}
+	// brotli 流的第一个字节通常是 0x0b（window 16）或 0x1b 等，第二个字节通常是 0x06 或 0x2e 之类
+	return data[0] == 0x0b || data[0] == 0x1b || data[0] == 0x81
+}
+
+// gunzip 解压 gzip 数据。
+func gunzip(data []byte) ([]byte, error) {
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer gr.Close()
+	return io.ReadAll(gr)
+}
+
+// unbrotli 解压 brotli 数据。
+func unbrotli(data []byte) ([]byte, error) {
+	br := brotli.NewReader(bytes.NewReader(data))
+	return io.ReadAll(br)
+}
+
+// decompress 根据 content-encoding 解压响应体，支持 gzip、br(brotli)、deflate(zlib)。
+func decompress(data []byte, contentEncoding string) ([]byte, error) {
+	enc := strings.TrimSpace(strings.ToLower(contentEncoding))
+	switch {
+	case enc == "gzip" || enc == "x-gzip":
+		return gunzip(data)
+	case enc == "br" || enc == "brotli":
+		return unbrotli(data)
+	case enc == "deflate":
+		zr, err := zlib.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		return io.ReadAll(zr)
+	default:
+		return data, nil
+	}
 }
 
 // 判断是否为文本内容（简单判断，ASCII范围）
